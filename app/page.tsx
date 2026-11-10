@@ -1,75 +1,248 @@
 'use client';
-import {useEffect,useMemo,useRef,useState} from 'react';
-import {Activity,ArrowDownRight,ArrowRight,ArrowUpRight,BarChart3,BrainCircuit,Check,CheckCircle2,ChevronDown,ChevronRight,CircleHelp,Command,Compass,Database,Download,ExternalLink,Eye,FileText,FlaskConical,GitBranch,Globe2,Layers3,LockKeyhole,Menu,MessageSquare,MoreHorizontal,Play,Plus,RefreshCw,Search,Send,ShieldCheck,SlidersHorizontal,Sparkles,Target,TrendingUp,UploadCloud,Wallet,X, Zap} from 'lucide-react';
-import {exposure,factorLabels,factorOrder,impact,intelligence,metrics,portfolios,PortfolioId,scenarios,sectorWeights,Shock,investigate} from '../lib/analytics';
-type View='overview'|'investigate'|'scenarios'|'exposures';
-type Result=ReturnType<typeof investigate>&{answer?:string|null;mode?:string;notice?:string};
-type Thread={q:string;r:Result};
-const money=(n:number)=>'$'+Math.abs(n/1e6).toFixed(1)+'M';
-const pct=(n:number,d=1)=>(n>=0?'+':'')+n.toFixed(d)+'%';
-const colors=['#b9a4ff','#55d6c2','#83a9ff','#e5a4a4','#e7c78c','#8f96a5'];
-const prompts=['What am I missing in this portfolio?','What would break this strategy?','Investigate hidden factor exposures','How do I compare against peers?'];
-function Sparkline({values,color='#bda8ff',fill=false,height=115}:{values:number[];color?:string;fill?:boolean;height?:number}){
- const w=620,pad=8,min=Math.min(...values)-1.8,max=Math.max(...values)+1.8;
- const pts=values.map((v,i)=>`${pad+i*(w-pad*2)/(values.length-1)},${height-pad-(v-min)/(max-min)*(height-pad*2)}`).join(' ');
- return <svg viewBox={`0 0 ${w} ${height}`} preserveAspectRatio="none" className="sparkline" aria-label="Illustrative cumulative growth chart">
-  <defs><linearGradient id="sparkfill" x1="0" x2="0" y1="0" y2="1"><stop offset="0%" stopColor={color} stopOpacity=".18"/><stop offset="100%" stopColor={color} stopOpacity="0"/></linearGradient></defs>
-  {[.25,.5,.75].map(i=><line key={i} x1="0" x2={w} y1={height*i} y2={height*i} stroke="#242a38" strokeDasharray="3 5"/>) }
-  {fill&&<polygon points={`8,${height} ${pts} ${w-8},${height}`} fill="url(#sparkfill)"/>}
-  <polyline points={pts} stroke={color} strokeWidth="2.5" fill="none" strokeLinecap="round" strokeLinejoin="round" vectorEffect="non-scaling-stroke" />
-  <circle cx={w-pad} cy={height-pad-(values[values.length-1]-min)/(max-min)*(height-pad*2)} r="4" fill={color}/>
- </svg>
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { ChevronRight, Compass, Download, FileText, FlaskConical, GitBranch, Layers3, Menu, Pencil, RotateCcw, ShieldCheck, Sparkles, X } from 'lucide-react';
+import type { PortfolioSpec, SpecUpdate, TraceStep } from '../lib/types';
+import type { AgentEvent, AgentRequest, InvestigationPayload } from '../lib/protocol';
+import { readAgentStream } from '../lib/protocol';
+import { buildPortfolio, EXAMPLES } from '../lib/portfolio';
+import { analyze } from '../lib/agent';
+import { Onboarding, HoldingsForm, CsvUpload } from './components/Onboarding';
+import { RunView } from './components/RunView';
+import { Overview } from './components/Overview';
+import { ScenarioLab } from './components/ScenarioLab';
+import { RiskExplorer } from './components/RiskExplorer';
+import { Investigator, type Turn } from './components/Investigator';
+import { ModeBadge, SourcePill, usd } from './components/ui';
+
+type Stage = 'onboard' | 'running' | 'workspace';
+type View = 'overview' | 'investigate' | 'scenarios' | 'exposures';
+type Saved = { v: 2; spec: PortfolioSpec; inv: InvestigationPayload | null; trace: TraceStep[]; thread: Turn[]; input: string };
+
+const STORE = 'atlas.session.v2';
+const TITLES: Record<View, [string, string]> = {
+  overview: ['Briefing', 'What Atlas found, how it found it, and what would sharpen it.'],
+  investigate: ['AI Investigator', 'Ask a question or add information. Atlas decides which analyses to run.'],
+  scenarios: ['Scenario Lab', 'Reprice every position under a market shock, then adjust it yourself.'],
+  exposures: ['Risk Explorer', 'Factors, shared themes, fund look-through and modeled correlations.'],
+};
+const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
+const uid = () => Math.random().toString(36).slice(2, 10);
+
+export default function Home() {
+  const [hydrated, setHydrated] = useState(false);
+  const [stage, setStage] = useState<Stage>('onboard');
+  const [view, setView] = useState<View>('overview');
+  const [mobile, setMobile] = useState(false);
+  const [mode, setMode] = useState<'ai' | 'demo' | null>(null);
+  const [spec, setSpec] = useState<PortfolioSpec | null>(null);
+  const [inv, setInv] = useState<InvestigationPayload | null>(null);
+  const [trace, setTrace] = useState<TraceStep[]>([]);
+  const [thread, setThread] = useState<Turn[]>([]);
+  const [input, setInput] = useState('');
+  const [understood, setUnderstood] = useState<{ label: string; value: string }[]>([]);
+  const [runSteps, setRunSteps] = useState<TraceStep[]>([]);
+  const [runDone, setRunDone] = useState(false);
+  const [runError, setRunError] = useState('');
+  const [clarify, setClarify] = useState<{ text: string; options: string[] } | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const [scenarioFocus, setScenarioFocus] = useState<string | undefined>();
+  const [toast, setToast] = useState<{ steps: TraceStep[]; label: string } | null>(null);
+  const specRef = useRef<PortfolioSpec | null>(null);
+  specRef.current = spec;
+
+  // ---------- persistence ----------
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(STORE);
+      if (raw) {
+        const s: Saved = JSON.parse(raw);
+        if (s.v === 2 && s.spec && buildPortfolio(s.spec)) {
+          setSpec(s.spec); setInv(s.inv); setTrace(s.trace || []); setThread((s.thread || []).filter(t => !t.pending)); setInput(s.input || ''); setStage('workspace');
+        }
+      }
+    } catch { /* storage unavailable */ }
+    setHydrated(true);
+    fetch('/api/agent').then(r => r.json()).then(j => setMode(j.ai ? 'ai' : 'demo')).catch(() => setMode('demo'));
+  }, []);
+  useEffect(() => {
+    if (!hydrated || stage !== 'workspace' || !spec) return;
+    try { localStorage.setItem(STORE, JSON.stringify({ v: 2, spec, inv, trace, thread: thread.filter(t => !t.pending), input } satisfies Saved)); } catch { /* ignore */ }
+  }, [hydrated, stage, spec, inv, trace, thread, input]);
+
+  const portfolio = useMemo(() => (spec ? buildPortfolio(spec) : null), [spec]);
+  const analysis = useMemo(() => (portfolio ? analyze(portfolio) : null), [portfolio]);
+
+  // ---------- agent calls ----------
+  const call = useCallback(async (req: AgentRequest, on: (e: AgentEvent) => void | Promise<void>) => {
+    const res = await fetch('/api/agent', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(req) });
+    if (!res.ok) throw new Error('The investigation service returned an error.');
+    await readAgentStream(res, on);
+  }, []);
+
+  const startOnboarding = async (req: AgentRequest, label: string) => {
+    setInput(label); setUnderstood([]); setRunSteps([]); setRunDone(false); setRunError(''); setClarify(null); setBusy(true);
+    let gotInvestigation = false;
+    let newSpec: PortfolioSpec | null = null;
+    let payload: InvestigationPayload | null = null;
+    const steps: TraceStep[] = [];
+    let switched = false;
+    try {
+      await call(req, async e => {
+        if (e.t === 'mode') setMode(e.mode);
+        else if (e.t === 'understood') { setUnderstood(e.items); }
+        else if (e.t === 'question') { setClarify({ text: e.text, options: e.options }); }
+        else if (e.t === 'spec') { newSpec = e.spec; if (!switched) { setStage('running'); switched = true; } setSpec(e.spec); }
+        else if (e.t === 'step') {
+          if (!switched) { setStage('running'); switched = true; }
+          steps.push(e.step); setRunSteps([...steps]);
+          await sleep(e.step.status === 'skipped' ? 160 : 380);
+        }
+        else if (e.t === 'investigation') { payload = e.payload; gotInvestigation = true; }
+        else if (e.t === 'error') throw new Error(e.message);
+      });
+      if (gotInvestigation && newSpec && payload) {
+        const pl = payload as InvestigationPayload;
+        setInv(pl); setTrace(steps); setRunDone(true);
+        setThread([{ id: uid(), user: label, steps, investigation: pl, notices: [], pending: false }]);
+        setView('overview');
+        if (pl.focusScenario) setScenarioFocus(pl.focusScenario);
+      } else if (switched) {
+        setStage('onboard');
+      }
+    } catch (err) {
+      if (switched) setRunError(err instanceof Error ? err.message : 'Something went wrong.');
+      else setClarify({ text: 'I couldn’t reach the analysis service. Please try again.', options: [] });
+    } finally { setBusy(false); }
+  };
+
+  /** Workspace messages: questions, new information, and unlock submissions. */
+  const send = async (req: AgentRequest, label: string, opts: { toView?: View; toast?: boolean } = {}) => {
+    if (busy) return;
+    const id = uid();
+    setBusy(true);
+    if (opts.toView) setView(opts.toView);
+    setThread(t => [...t, { id, user: label, steps: [], notices: [], pending: true }]);
+    const patch = (fn: (t: Turn) => Turn) => setThread(ts => ts.map(t => (t.id === id ? fn(t) : t)));
+    if (opts.toast) setToast({ steps: [], label });
+    const steps: TraceStep[] = [];
+    try {
+      await call({ ...req, spec: specRef.current ?? undefined, history: thread.slice(-4).flatMap(t => [{ role: 'user' as const, text: t.user }, { role: 'atlas' as const, text: t.answer?.lead ?? t.investigation?.narrative ?? '' }]) }, async e => {
+        if (e.t === 'mode') setMode(e.mode);
+        else if (e.t === 'step') { steps.push(e.step); patch(t => ({ ...t, steps: [...steps] })); if (opts.toast) setToast({ steps: [...steps], label }); await sleep(e.step.status === 'skipped' ? 100 : 220); }
+        else if (e.t === 'spec') setSpec(e.spec);
+        else if (e.t === 'investigation') { setInv(e.payload); setTrace([...steps]); patch(t => ({ ...t, investigation: e.payload })); if (e.payload.focusScenario) setScenarioFocus(e.payload.focusScenario); }
+        else if (e.t === 'answer') { patch(t => ({ ...t, answer: e.payload })); if (e.payload.focus?.scenario) setScenarioFocus(e.payload.focus.scenario); }
+        else if (e.t === 'question') patch(t => ({ ...t, question: { text: e.text, options: e.options } }));
+        else if (e.t === 'notice') patch(t => ({ ...t, notices: [...t.notices, e.text] }));
+        else if (e.t === 'error') throw new Error(e.message);
+      });
+      patch(t => ({ ...t, pending: false }));
+    } catch (err) {
+      patch(t => ({ ...t, pending: false, error: err instanceof Error ? err.message : 'Something went wrong.' }));
+    } finally {
+      setBusy(false);
+      setTimeout(() => setToast(null), 900);
+    }
+  };
+
+  const ask = (q: string) => send({ kind: 'chat', text: q }, q, { toView: 'investigate' });
+  const applyUpdate = (u: SpecUpdate, label: string) => { setEditing(false); send({ kind: 'apply', update: u }, label, { toast: view !== 'investigate' }); };
+
+  const reset = () => {
+    try { localStorage.removeItem(STORE); } catch { /* ignore */ }
+    setSpec(null); setInv(null); setTrace([]); setThread([]); setInput(''); setUnderstood([]); setRunSteps([]); setRunDone(false); setClarify(null); setStage('onboard'); setView('overview'); setMobile(false);
+  };
+
+  const exportReport = () => {
+    if (!portfolio || !analysis) return;
+    const data = { generatedAt: new Date().toISOString(), disclaimer: 'Illustrative factor model with hand-set parameters; not market data; not investment advice.', basis: portfolio.source, portfolio, assumptions: portfolio.assumptions, metrics: { concentration: analysis.conc, risk: analysis.risk, exposures: analysis.exp }, themes: analysis.themes, lookThrough: analysis.lt.rows, scenarios: analysis.scenarios.map(s => ({ name: s.name, shock: s.shock, themeShocks: s.themeShocks, pct: s.result.pct, dollars: s.result.dollars })), briefing: inv, investigations: thread.map(t => ({ input: t.user, trace: t.steps, answer: t.answer, investigation: t.investigation })) };
+    const url = URL.createObjectURL(new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' }));
+    const el = document.createElement('a'); el.href = url; el.download = 'atlas-investigation.json'; el.click(); URL.revokeObjectURL(url);
+  };
+
+  if (!hydrated) return <div className="boot"><Compass size={22} /></div>;
+
+  if (stage === 'onboard') return <Onboarding mode={mode} pending={busy} clarify={clarify}
+    onText={t => startOnboarding({ kind: 'onboard', text: t }, t)}
+    onUpdate={(u, label) => startOnboarding({ kind: 'onboard', update: u }, label)}
+    onExample={id => startOnboarding({ kind: 'onboard', exampleId: id }, `Explore the example portfolio: ${EXAMPLES.find(e => e.id === id)?.name}`)} />;
+
+  if (stage === 'running') return <RunView input={input} understood={understood} steps={runSteps} portfolio={portfolio}
+    headline={inv && runDone ? inv.findings.find(f => f.id === inv.headlineId) ?? inv.findings[0] ?? null : null}
+    done={runDone} error={runError} onOpen={() => setStage('workspace')} onBack={reset} />;
+
+  if (!portfolio || !analysis) return <div className="boot"><button className="primary-btn" onClick={reset}>Start a new analysis</button></div>;
+
+  const suggestions = Array.from(new Set([...(inv?.findings.slice(0, 3).map(f => f.followup) ?? []), 'Compare against the S&P 500', 'How could I hedge my worst scenario?'])).slice(0, 5);
+  const nav: [View, string, typeof Layers3][] = [['overview', 'Briefing', Layers3], ['investigate', 'AI Investigator', Sparkles], ['scenarios', 'Scenario Lab', FlaskConical], ['exposures', 'Risk Explorer', GitBranch]];
+
+  return <div className="app-shell">
+    <div className={`sidebar-cover ${mobile ? 'show' : ''}`} onClick={() => setMobile(false)} />
+    <aside className={`sidebar ${mobile ? 'mobile-open' : ''}`}>
+      <div className="brand"><div className="brand-logo"><Compass size={20} strokeWidth={2.2} /></div><div><div className="brand-title">atlas<span className="brand-dot">.</span></div><div className="brand-caption">PORTFOLIO INTELLIGENCE</div></div><button className="close-mobile" onClick={() => setMobile(false)} aria-label="Close menu"><X size={18} /></button></div>
+      <button className="workspace-tag" onClick={() => { setEditing(true); setMobile(false); }}><span className="ws-icon">{portfolio.source === 'proxy' ? '~' : portfolio.source === 'example' ? 'E' : 'P'}</span><span><strong>{portfolio.name}</strong><small>{analysis.conc.count} positions{portfolio.value != null ? ` · ${usd(portfolio.value)}` : ''}</small></span><Pencil size={13} /></button>
+      <div className="nav-label">WORKSPACE</div>
+      <nav className="nav-list">{nav.map(([id, title, Icon]) => <button key={id} onClick={() => { setView(id); setMobile(false); }} className={`nav-item ${view === id ? 'active' : ''}`}><Icon size={17} /><span>{title}</span>{id === 'investigate' && <span className="ai-mini">{busy ? '…' : 'AI'}</span>}</button>)}</nav>
+      <div className="nav-label lower">PORTFOLIO</div>
+      <div className="nav-list">
+        <button className="nav-item" onClick={() => { setEditing(true); setMobile(false); }}><Pencil size={17} /><span>Edit holdings</span></button>
+        <button className="nav-item" onClick={reset}><RotateCcw size={17} /><span>New analysis</span></button>
+        <button className="nav-item" onClick={() => document.getElementById('methodology')?.scrollIntoView({ behavior: 'smooth' })}><FileText size={17} /><span>Methodology</span></button>
+      </div>
+      <div className="sidebar-bottom">
+        <div className="demo-notice"><span className="status-pulse" /><span>{mode === 'ai' ? 'AI-ENHANCED' : 'DEMO MODE'}</span></div>
+        <p>{mode === 'ai' ? 'A language model chooses investigations and writes narratives. Every number comes from deterministic tools.' : 'Deterministic extraction, planning and analysis. Add an API key for AI-driven investigation.'}</p>
+        <div className="side-footer"><ShieldCheck size={14} /> Modeled estimates, not market data</div>
+      </div>
+    </aside>
+
+    <main className="main">
+      <header className="topbar">
+        <div className="crumbs"><button className="menu-button" onClick={() => setMobile(true)} aria-label="Open navigation"><Menu size={20} /></button><span className="crumb-hide">Workspace</span><ChevronRight size={14} className="crumb-hide" /><strong>{TITLES[view][0]}</strong></div>
+        <div className="top-actions"><ModeBadge mode={mode} /><button className="icon-button" title="Download investigation (JSON)" onClick={exportReport}><Download size={17} /></button></div>
+      </header>
+      <div className="content">
+        <div className="portfolio-bar">
+          <div className="portfolio-bar-left"><div className="portfolio-icon"><Layers3 size={19} /></div><div><span className="small-label">ANALYZING</span><strong className="portfolio-name">{portfolio.name}</strong></div></div>
+          <div className="portfolio-bar-right">
+            <SourcePill p={portfolio} />
+            <div className="portfolio-aum"><small>{portfolio.valueSource === 'example' ? 'EXAMPLE AUM' : 'PORTFOLIO SIZE'}</small><strong>{portfolio.value != null ? usd(portfolio.value) : '—'}</strong></div>
+            <button className="secondary-btn" onClick={() => setEditing(true)}><Pencil size={13} /> Edit</button>
+          </div>
+        </div>
+        {portfolio.source === 'proxy' && <div className="proxy-banner"><span><strong>You’re viewing an illustrative proxy.</strong> These holdings represent the portfolio you described; they aren’t yours. Share real holdings and every figure here recalculates for your portfolio.</span><button className="primary-btn" onClick={() => setEditing(true)}>Add holdings</button></div>}
+        <div className="headline-row"><div><h1>{TITLES[view][0]}</h1><p className="page-subtitle">{TITLES[view][1]}</p></div></div>
+
+        {view === 'overview' && <Overview p={portfolio} a={analysis} inv={inv} trace={trace} onUnlock={applyUpdate} onEditHoldings={() => setEditing(true)} onAsk={ask} busy={busy} />}
+        {view === 'investigate' && <Investigator p={portfolio} a={analysis} thread={thread} onAsk={ask} busy={busy} suggestions={suggestions} />}
+        {view === 'scenarios' && <ScenarioLab p={portfolio} initial={scenarioFocus} onAsk={ask} />}
+        {view === 'exposures' && <RiskExplorer p={portfolio} a={analysis} onAsk={ask} onEdit={() => setEditing(true)} />}
+
+        <footer id="methodology">
+          <div><strong>ATLAS</strong><span>Independent concept demo. Not affiliated with any index or data provider. Risk figures come from a deterministic linear factor model (growth, rates, credit, oil) with hand-set, illustrative sensitivities, a factor covariance matrix, and theme-based co-movement. Fund look-through uses approximate static compositions. Nothing here is live market data or investment advice.</span></div>
+          <span>Volatility = √(wᵀΣw) · Risk share = wᵢ(Σw)ᵢ / σ² · Scenario move = Σ sensitivity × shock (+ theme shock) · 1-in-20 loss = 1.645σ</span>
+        </footer>
+      </div>
+    </main>
+
+    {editing && <div className="modal-cover" onClick={() => setEditing(false)}>
+      <div className="modal" onClick={e => e.stopPropagation()} role="dialog" aria-label="Edit holdings">
+        <div className="modal-head"><div><span className="kicker">YOUR HOLDINGS</span><h2>{portfolio.source === 'user' ? 'Edit positions' : 'Replace the proxy with your positions'}</h2></div><button className="icon-button" onClick={() => setEditing(false)} aria-label="Close"><X size={18} /></button></div>
+        <p className="panel-intro">Atlas re-runs the full investigation and shows you what changed.</p>
+        <EditTabs spec={spec!} busy={busy} onApply={applyUpdate} />
+      </div>
+    </div>}
+
+    {toast && <div className="run-toast"><div className="run-toast-head"><span className="loader small" /><strong>Re-investigating</strong><small>{toast.label}</small></div>{toast.steps.slice(-3).map(s => <div key={s.id} className="run-toast-step">✓ {s.title}</div>)}</div>}
+  </div>;
 }
-function Donut({p}:{p:PortfolioId}){const sectors=sectorWeights(portfolios[p]);let sum=0;return <div className="donut-shell"><div className="donut" style={{background:`conic-gradient(${sectors.map((s,i)=>{const start=sum;sum+=s.value;return `${colors[i%colors.length]} ${start}% ${sum}%`;}).join(',')})`}}><div className="donut-hole"><span>100%</span><small>allocated</small></div></div></div>}
-function Sidebar({view,setView,mobile,setMobile}:{view:View;setView:(v:View)=>void;mobile:boolean;setMobile:(x:boolean)=>void}){
- const items:[View,string,React.ReactNode][]=[['overview','Overview',<Layers3 size={17} key="a"/>],['investigate','AI Investigator',<Sparkles size={17} key="b"/>],['scenarios','Scenario Lab',<FlaskConical size={17} key="c"/>],['exposures','Risk Exposures',<GitBranch size={17} key="d"/>]];
- return <><div className={`sidebar-cover ${mobile?'show':''}`} onClick={()=>setMobile(false)}></div><aside className={`sidebar ${mobile?'mobile-open':''}`}>
-  <div className="brand"><div className="brand-logo"><Compass size={20} strokeWidth={2.2}/></div><div><div className="brand-title">atlas<span className="brand-dot">.</span></div><div className="brand-caption">PORTFOLIO INTELLIGENCE</div></div><button className="close-mobile" onClick={()=>setMobile(false)} aria-label="Close menu"><X size={18}/></button></div>
-  <div className="workspace-tag"><span className="ws-icon">A</span><span><strong>Atlas Workspace</strong><small>Exploration environment</small></span><ChevronDown size={14}/></div>
-  <div className="nav-label">WORKSPACE</div><nav className="nav-list">{items.map(([id,title,icon])=><button key={id} onClick={()=>{setView(id);setMobile(false)}} className={`nav-item ${view===id?'active':''}`}>{icon}<span>{title}</span>{id==='investigate'&&<span className="ai-mini">AI</span>}</button>)}</nav>
-  <div className="nav-label lower">RESOURCES</div><div className="nav-list"><button className="nav-item" onClick={()=>document.getElementById('methodology')?.scrollIntoView({behavior:'smooth'})}><FileText size={17}/>Methodology</button><button className="nav-item" onClick={()=>window.open('https://github.com/new','_blank','noopener,noreferrer')}><ExternalLink size={17}/>Publish project</button></div>
-  <div className="sidebar-bottom"><div className="demo-notice"><span className="status-pulse"></span><span>DEMO ENVIRONMENT</span></div><p>Exploration powered by synthetic portfolios and transparent analytical models.</p><div className="side-footer"><ShieldCheck size={14}/> No private data required</div></div>
- </aside></>
-}
-function MiniKpi({label,value,detail,icon,accent}:{label:string;value:string;detail:string;icon:React.ReactNode;accent?:boolean}){return <div className="kpi"><div className="kpi-top"><span>{label}</span>{icon}</div><div className="kpi-val">{value}</div><div className={`kpi-detail ${accent?'purple':''}`}>{detail}</div></div>}
-export default function Home(){
- const [view,setView]=useState<View>('overview');const [id,setId]=useState<PortfolioId>('ai');const [mobile,setMobile]=useState(false);
- const [query,setQuery]=useState('');const [running,setRunning]=useState(false);const [thread,setThread]=useState<Thread[]>([]);const [error,setError]=useState('');
- const [scenario,setScenario]=useState('ai');const [custom,setCustom]=useState<Shock>({...scenarios.ai.shock});
- const [selectedInsight,setSelectedInsight]=useState('');const threadEnd=useRef<HTMLDivElement>(null);
- const p=portfolios[id],m=metrics(p),exp=exposure(p),insights=intelligence(p),scenarioResult=impact(p,custom);
- useEffect(()=>{setCustom({...scenarios[scenario].shock})},[scenario]);
- useEffect(()=>{threadEnd.current?.scrollIntoView({behavior:'smooth',block:'nearest'})},[thread,running]);
- const ask=async(input?:string)=>{
-  const text=(input??query).trim();if(!text||running)return;
-  setView('investigate');setQuery('');setRunning(true);setError('');
-  try{const resp=await fetch('/api/investigate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({portfolioId:id,question:text})});if(!resp.ok)throw Error('Request failed');const r:Result=await resp.json();setThread(old=>[...old,{q:text,r}]);}
-  catch{setError('Could not reach the investigation service. Please retry.');}finally{setRunning(false)}
- };
- const changePortfolio=(next:PortfolioId)=>{setId(next);setThread([]);setSelectedInsight('')};
- const exportReport=()=>{const result={generatedAt:new Date().toISOString(),disclaimer:'Synthetic portfolio; simplified illustrative factor model; not investment advice.',portfolio:p,metrics:m,exposures:exp,scenario:scenarios[scenario].name,shock:custom,scenarioResult,investigations:thread};const blob=new Blob([JSON.stringify(result,null,2)],{type:'application/json'});const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download='atlas-investigation-demo.json';a.click();URL.revokeObjectURL(url)};
- return <div className="app-shell"><Sidebar view={view} setView={setView} mobile={mobile} setMobile={setMobile}/><main className="main">
- <header className="topbar"><div className="crumbs"><button className="menu-button" onClick={()=>setMobile(true)} aria-label="Open navigation"><Menu size={20}/></button><span>Workspace</span><ChevronRight size={14}/><strong>{({overview:'Overview',investigate:'AI Investigator',scenarios:'Scenario Lab',exposures:'Risk Exposures'} as Record<View,string>)[view]}</strong></div><div className="top-actions"><span className="live-demo"><span/> SYNTHETIC DATA</span><button className="icon-button" title="Download demo report" onClick={exportReport}><Download size={17}/></button><div className="avatar">AT</div></div></header>
- <div className="content">
- <div className="eyebrow"><span className="eyebrow-dot"/> THE NEXT GENERATION OF PORTFOLIO INTELLIGENCE</div>
- <div className="headline-row"><div><h1>{view==='overview'?'See beyond the surface.':view==='investigate'?'Follow the evidence.':view==='scenarios'?'Ask what happens next.':'Discover what drives risk.'}</h1><p className="page-subtitle">{view==='overview'?'Understand hidden exposures, discover vulnerabilities, and explore what matters — before connecting a single holding.':view==='investigate'?'Give Atlas a question. It will analyze the evidence, run the numbers, and surface the next question worth asking.':view==='scenarios'?'Challenge your assumptions with modeled market shocks and a live factor sensitivity explorer.':'Look beneath sector labels and explore the common drivers of portfolio behavior.'}</p></div><button className="secondary-btn download-main" onClick={exportReport}><Download size={15}/> Export analysis</button></div>
- <div className="portfolio-bar"><div className="portfolio-bar-left"><div className="portfolio-icon"><Wallet size={19}/></div><div><span className="small-label">EXPLORING PORTFOLIO</span><select className="portfolio-select" aria-label="Select sample portfolio" value={id} onChange={e=>changePortfolio(e.target.value as PortfolioId)}><option value="ai">AI & Technology Growth</option><option value="balanced">Global Balanced Allocation</option><option value="transition">Energy Transition Leaders</option></select></div></div><div className="portfolio-bar-right"><span className="portfolio-pill"><span className="portfolio-pill-dot"/> Example strategy</span><div className="portfolio-aum"><small>ILLUSTRATIVE AUM</small><strong>${(p.value/1e6).toFixed(0)}M</strong></div></div></div>
- {view==='overview'&&<>
-  <div className="kpi-grid"><MiniKpi label="Top 3 concentration" value={m.top3.toFixed(0)+'%'} detail="Combined portfolio weight" icon={<Target size={17}/>} accent/><MiniKpi label="Effective holdings" value={m.effective.toFixed(1)} detail={`Across ${m.total} positions`} icon={<Layers3 size={17}/>} /><MiniKpi label="Weighted asset volatility" value={m.weightedVol.toFixed(1)+'%'} detail="Synthetic, not portfolio VaR" icon={<Activity size={17}/>} /><MiniKpi label="Largest factor" value={factorOrder.slice().sort((a,b)=>Math.abs(exp[b])-Math.abs(exp[a]))[0].toUpperCase()} detail="Modeled factor loading" icon={<GitBranch size={17}/>} /></div>
-  <div className="primary-grid"><section className="panel performance-panel"><div className="panel-heading"><div><span className="kicker">STRATEGY OVERVIEW</span><h2>Portfolio trajectory</h2></div><span className="quiet-pill"><span className="quiet-dot"/> Illustrative</span></div><div className="performance-stats"><div><strong>{pct(p.monthly[p.monthly.length-1])}</strong><span>12-point cumulative illustration</span></div><span className="fake-range">Sample period <ChevronDown size={13}/></span></div><div className="chart-wrap"><Sparkline values={p.monthly} height={155} fill/></div><div className="axis-labels"><span>START</span><span>03</span><span>06</span><span>09</span><span>END</span></div><div className="chart-legend"><span className="legend-line"></span> Hypothetical cumulative path <span className="legend-sub">Not market-derived</span></div></section>
-  <section className="panel allocations"><div className="panel-heading"><div><span className="kicker">PORTFOLIO COMPOSITION</span><h2>Where capital sits</h2></div><MoreHorizontal size={19} color="#768097"/></div><Donut p={id}/><div className="sector-list">{sectorWeights(p).slice(0,5).map((s,i)=><div key={s.name} className="sector-row"><span className="sector-name"><i style={{background:colors[i]}}/>{s.name}</span><strong>{s.value}%</strong></div>)}</div></section></div>
-  <div className="insights-title-row"><div><span className="kicker">SIGNALS WORTH INVESTIGATING</span><h2>Atlas has already found a few things.</h2></div><button className="text-link" onClick={()=>ask('What am I missing in this portfolio?')}>Run full investigation <ArrowRight size={15}/></button></div>
-  <div className="insight-grid">{insights.map((n,i)=><button key={n.id} className="insight-card" onClick={()=>{setSelectedInsight(n.id);ask(n.question)}}><div className="insight-card-head"><span className="signal-type">{i===0?<Target size={15}/>:i===1?<GitBranch size={15}/>:<BarChart3 size={15}/>} {n.type}</span><span className={`priority ${n.priority.toLowerCase()}`}>{n.priority}</span></div><h3>{n.title}</h3><p>{n.description}</p><span className="insight-cta">Investigate signal <ArrowUpRight size={15}/></span></button>)}</div>
-  <div className="agent-banner"><div className="agent-banner-icon"><Sparkles size={22}/></div><div><h3>What if your portfolio could explain itself?</h3><p>Ask Atlas to investigate a risk, challenge a thesis, or simulate an unexpected market event.</p></div><button className="primary-btn" onClick={()=>{setView('investigate');setTimeout(()=>document.getElementById('atlas-question')?.focus(),50)}}>Open AI Investigator <ArrowRight size={16}/></button></div>
- </>}
- {view==='investigate'&&<div className="investigate-layout"><section className="panel investigator-panel"><div className="investigator-head"><div className="agent-avatar"><Sparkles size={20}/></div><div><h2>Atlas Investigator</h2><p>Research agent · Quantitative tools · Evidence-first</p></div><span className="investigator-state"><span/> Ready to investigate</span></div>
-  <div className="conversation">{thread.length===0&&<div className="empty-investigation"><div className="empty-visual"><div className="orb orb1"/><div className="orb orb2"/><BrainCircuit size={31}/></div><div className="empty-kicker">YOUR RESEARCH PARTNER</div><h2>What's keeping you up at night?</h2><p>Ask a complicated question. Atlas will explore the portfolio, run calculations, and tell you what it discovered — not just ask you more questions.</p><div className="prompt-grid">{prompts.map((s,i)=><button key={s} onClick={()=>ask(s)}><span className="prompt-icon">{[<Search size={16} key="1"/>,<FlaskConical size={16} key="2"/>,<GitBranch size={16} key="3"/>,<Globe2 size={16} key="4"/>][i]}</span>{s}<ArrowUpRight size={14}/></button>)}</div></div>}
-   {thread.map((t,i)=><div className="conversation-turn" key={i}><div className="user-msg"><span>YOU</span><p>{t.q}</p></div><div className="agent-msg"><div className="result-header"><span className="agent-avatar small"><Sparkles size={15}/></span><div><strong>Atlas</strong><small>{t.r.mode==='ai'?'AI synthesis + verified tool calculations':'Deterministic research demo'}</small></div><span className="done-tag"><Check size={12}/> Analysis complete</span></div><p className="result-lead">{t.r.answer||t.r.lead}</p><div className="steps"><div className="steps-title"><CheckCircle2 size={15}/> INVESTIGATION TRACE</div>{t.r.steps.map((s,j)=><div key={j} className="step"><span className="step-check"><Check size={11}/></span>{s}</div>)}</div><div className="findings-header">KEY FINDINGS <span>{t.r.findings.length} SIGNALS</span></div>{t.r.findings.map((f,j)=><div className="finding" key={j}><div className="finding-index">0{j+1}</div><p>{f}</p></div>)}<div className="result-foot"><ShieldCheck size={14}/>{t.r.disclaimer}</div><div className="followups"><span>GO DEEPER</span>{t.r.followups.map(f=><button onClick={()=>ask(f)} key={f}>{f} <ArrowUpRight size={13}/></button>)}</div></div></div>)}
-  {running&&<div className="working"><span className="loader"/><div><strong>Atlas is investigating...</strong><small>Retrieving holdings · Evaluating risk factors · Running analytics</small></div></div>}{error&&<div className="error-text">{error}</div>}<div ref={threadEnd}/></div>
-  <form className="investigate-compose" onSubmit={e=>{e.preventDefault();ask()}}><div className="compose-box"><Sparkles size={18}/><input id="atlas-question" placeholder="Ask anything about this portfolio..." value={query} onChange={e=>setQuery(e.target.value)} maxLength={1200} aria-label="Question for Atlas"/><button aria-label="Send question" disabled={running||!query.trim()}><ArrowRight size={17}/></button></div><div className="compose-footer"><span><ShieldCheck size={13}/> Synthetic data only · No sensitive holdings</span><span>{thread.length?'Continue investigating':'Try asking a what-if question'}</span></div></form></section>
- <aside className="investigate-right"><div className="panel side-panel"><span className="kicker">RESEARCH CONTEXT</span><h3>{p.name}</h3><p>{p.description}</p><div className="context-row"><span>Positions</span><strong>{m.total}</strong></div><div className="context-row"><span>Top 3 weight</span><strong>{m.top3.toFixed(0)}%</strong></div><div className="context-row"><span>Modeled tech loading</span><strong>{exp.tech.toFixed(2)}</strong></div><div className="context-row"><span>Benchmark label</span><strong>{p.benchmark}</strong></div></div><div className="panel side-panel suggestion-panel"><span className="kicker">WAYS TO GO DEEPER</span><h3>Try these investigations</h3>{['Which holdings share the same risk drivers?','Simulate a global recession','How does concentration change my downside?'].map(s=><button key={s} onClick={()=>ask(s)}>{s}<ArrowUpRight size={14}/></button>)}</div><div className="pro-tip"><Sparkles size={16}/><span>Connect an AI API key on Vercel to turn deterministic research into model-generated analysis.</span></div></aside></div>}
- {view==='scenarios'&&<div className="scenario-layout"><section className="panel scenario-main"><div className="panel-heading"><div><span className="kicker">STRESS TEST WORKBENCH</span><h2>Model a market shock</h2></div><span className="quiet-pill">SIMPLIFIED FACTOR MODEL</span></div><p className="panel-intro">Adjust hypothetical factor shocks and instantly see their weighted effect on the selected synthetic portfolio. The model is linear, illustrative, and not predictive.</p><div className="scenario-options">{Object.entries(scenarios).map(([key,s])=><button key={key} className={`scenario-option ${scenario===key?'selected':''}`} onClick={()=>setScenario(key)}><span>{s.name}</span>{scenario===key?<CheckCircle2 size={16}/>:<ArrowUpRight size={15}/>}</button>)}</div><div className="sliders-heading"><h3>Fine-tune factor shocks</h3><button onClick={()=>setCustom({...scenarios[scenario].shock})}><RefreshCw size={13}/> Reset</button></div><div className="sliders">{factorOrder.map(f=><div className="slider-row" key={f}><div className="slider-label"><span>{factorLabels[f]}</span><strong>{custom[f]>0?'+':''}{custom[f].toFixed(1)} <small>units</small></strong></div><input type="range" min={f==='tech'?-30:f==='energy'?-30:-12} max={f==='tech'?20:f==='energy'?30:12} step=".5" value={custom[f]} onChange={e=>setCustom(old=>({...old,[f]:Number(e.target.value)}))}/></div>)}</div><div className="small-caveat"><CircleHelp size={14}/> Shock units are illustrative model inputs, not percentage market moves. Factor contributions are loading × shock ÷ 10.</div></section><aside className="scenario-results"><section className="panel impact-panel"><span className="kicker">MODELED PORTFOLIO IMPACT</span><div className={`impact-number ${scenarioResult.pct>=0?'positive':'negative'}`}>{pct(scenarioResult.pct)}</div><div className="impact-currency">{scenarioResult.dollars<0?'−':'+'}{money(scenarioResult.dollars)} <span>illustrative change</span></div><div className="impact-divider"/><h3>Factor contribution</h3>{scenarioResult.contributions.map(c=><div className="contribution-row" key={c.factor}><span>{c.label}</span><strong className={c.value<0?'negative':'positive'}>{pct(c.value)}</strong></div>)}<button className="scenario-ask" onClick={()=>ask(`Investigate the ${scenarios[scenario].name} shock and the key positions driving the modeled downside`)}><Sparkles size={15}/> Ask Atlas to investigate <ArrowRight size={15}/></button></section><section className="panel holdings-impact"><span className="kicker">MODELED HOLDING IMPACTS</span>{scenarioResult.holdings.map(h=><div className="holding-impact" key={h.ticker}><strong>{h.ticker}</strong><div className="impact-track"><span style={{width:`${Math.min(100,Math.abs(h.impact)*3)}%`,background:h.impact<0?'#ef8f9d':'#66d9bc'}}/></div><span className={h.impact<0?'negative':'positive'}>{pct(h.impact)}</span></div>)}</section></aside></div>}
- {view==='exposures'&&<div className="risk-grid"><section className="panel risk-factor-panel"><div className="panel-heading"><div><span className="kicker">THE HIDDEN DRIVERS</span><h2>Factor exposure map</h2></div><span className="quiet-pill">SYNTHETIC COEFFICIENTS</span></div><p className="panel-intro">Weights alone can hide common market sensitivities. Factor loadings below are illustrative weighted averages from synthetic risk coefficients.</p><div className="factor-chart">{factorOrder.map((k,i)=><div className="factor-bar-row" key={k}><div className="factor-bar-label"><span>{factorLabels[k]}</span><strong>{exp[k]>=0?'+':''}{exp[k].toFixed(2)}</strong></div><div className="factor-bar-track"><div className="zero-line"/><div className="factor-bar-fill" style={{width:`${Math.min(48,Math.abs(exp[k])/2.3*48)}%`,left:exp[k]<0?`${50-Math.min(48,Math.abs(exp[k])/2.3*48)}%`:'50%',background:colors[i]}}/></div></div>)}</div><div className="panel-method">How it works: ∑(holding weight × illustrative sensitivity). Values are not validated historical betas or a risk-factor model from MSCI.</div></section><section className="panel holdings-panel"><div className="panel-heading"><div><span className="kicker">UNDER THE HOOD</span><h2>Top holdings</h2></div><span className="quiet-pill">{p.holdings.length} POSITIONS</span></div><div className="holdings-table"><div className="holdings-header"><span>ASSET</span><span>SECTOR</span><span>WEIGHT</span></div>{p.holdings.slice().sort((a,b)=>b.weight-a.weight).map((h,i)=><div className="holdings-row" key={h.ticker}><div className="asset-cell"><span className="ticker-icon" style={{background:`${colors[i%colors.length]}20`,color:colors[i%colors.length]}}>{h.ticker.slice(0,2)}</span><div><strong>{h.ticker}</strong><small>{h.name}</small></div></div><span className="asset-sector">{h.sector}</span><strong>{h.weight}%</strong></div>)}</div></section><section className="panel action-panel"><div className="action-panel-icon"><GitBranch size={24}/></div><div><h3>Correlation isn't obvious from sector labels.</h3><p>Different companies and asset classes can share the same modeled drivers. Let Atlas investigate where those exposures overlap.</p></div><button className="primary-btn" onClick={()=>ask('Investigate my hidden factor exposures and shared risk drivers')}>Investigate overlap <ArrowRight size={15}/></button></section></div>}
- <footer id="methodology"><div><strong>ATLAS</strong> <span>Independent concept demo for portfolio intelligence. Not affiliated with, endorsed by, or using proprietary data from MSCI or Intuit.</span></div><span>Synthetic sample portfolios · Simplified scenario model · Not investment advice</span></footer>
- </div></main></div>;
+
+function EditTabs({ spec, busy, onApply }: { spec: PortfolioSpec; busy: boolean; onApply: (u: SpecUpdate, label: string) => void }) {
+  const [tab, setTab] = useState<'form' | 'csv'>('form');
+  const initial = spec.exampleId || !spec.holdings.length ? (spec.exampleId ? spec.holdings : []) : spec.holdings;
+  return <>
+    <div className="composer-tabs inline"><button className={tab === 'form' ? 'active' : ''} onClick={() => setTab('form')}>Enter positions</button><button className={tab === 'csv' ? 'active' : ''} onClick={() => setTab('csv')}>Upload CSV</button></div>
+    {tab === 'form' ? <HoldingsForm compact pending={busy} initial={initial} initialAum={spec.aum} submitLabel="Re-investigate" onSubmit={onApply} /> : <CsvUpload pending={busy} onSubmit={onApply} />}
+  </>;
 }

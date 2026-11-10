@@ -1,5 +1,6 @@
 import type { Metadata } from 'next';
 import './globals.css';
+import './atlas.css';
 export const metadata: Metadata = {
   title: 'Atlas — Portfolio Intelligence',
   description: 'An autonomous portfolio investigation concept. Explore factor exposures, stress test hypothetical portfolios, and investigate risks with AI.',
